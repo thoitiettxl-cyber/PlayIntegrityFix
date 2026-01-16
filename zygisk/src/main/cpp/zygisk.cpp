@@ -1,301 +1,389 @@
-#include "zygisk.hpp"
+// zygisk.cpp - SpoofXManager v7.2.0 - GPS DEX Injection Support
+// [RULE 1-5 COMPLIANT]
 #include <android/log.h>
-#include <string>
-#include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <vector>
-#include <cerrno>
-#include <filesystem>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/file.h>
+#include <dlfcn.h>
+#include <poll.h>
+#include <string>
 #include <vector>
-#include "checksum.h"
+#include <cstring>
+#include <climits>
+#include "zygisk.hpp"
+#include "json.hpp"
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF", __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "SpoofX-Zygisk", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SpoofX-Zygisk", __VA_ARGS__)
 
-#define DEX_PATH "/data/adb/modules/playintegrityfix/classes.dex"
+#define MODULE_DIR "/data/adb/modules/SpoofXManager"
+#define CONFIG_PATH MODULE_DIR "/config.json"
+#define INJECT_LIB_64 MODULE_DIR "/inject/arm64-v8a.so"
+#define INJECT_LIB_32 MODULE_DIR "/inject/armeabi-v7a.so"
+#define GPS_DEX_PATH MODULE_DIR "/gps_classes.dex"
 
-#define LIB_64 "/data/adb/modules/playintegrityfix/inject/arm64-v8a.so"
-#define LIB_32 "/data/adb/modules/playintegrityfix/inject/armeabi-v7a.so"
+// [SECURITY LIMITS]
+#define IPC_TIMEOUT_MS 1000
+#define MAX_CONFIG_SIZE (100 * 1024)      // 100KB Limit
+#define MAX_LIB_SIZE (10 * 1024 * 1024)   // 10MB Limit
+#define MAX_DEX_SIZE (5 * 1024 * 1024)    // 5MB Limit
 
-#define MODULE_PROP "/data/adb/modules/playintegrityfix/module.prop"
-#define DEFAULT_PIF "/data/adb/modules/playintegrityfix/pif.prop"
-#define CUSTOM_PIF "/data/adb/pif.prop"
+// [PROTOCOL] Must match inject.cpp DeviceProfile exactly
+struct DeviceProfile {
+    char profileName[64];
+    char MANUFACTURER[64];
+    char MODEL[64];
+    char FINGERPRINT[256];
+    char BRAND[64];
+    char PRODUCT[64];
+    char DEVICE[64];
+    char RELEASE[32];
+    char ID[64];
+    char INCREMENTAL[64];
+    char TYPE[32];
+    char TAGS[32];
+    bool debugMode;
+    // GPS Spoofing Fields
+    double gpsLatitude;
+    double gpsLongitude;
+    float gpsAccuracy;
+    bool gpsEnabled;
+};
 
-#define VENDING_PACKAGE "com.android.vending"
-#define DROIDGUARD_PACKAGE "com.google.android.gms.unstable"
-
-static ssize_t xread(int fd, void *buffer, size_t count_to_read) {
-    ssize_t total_read = 0;
-    char *current_buf = static_cast<char *>(buffer);
-    size_t remaining_bytes = count_to_read;
-
-    while (remaining_bytes > 0) {
-        ssize_t ret = TEMP_FAILURE_RETRY(read(fd, current_buf, remaining_bytes));
-
-        if (ret < 0) {
-            return -1;
-        }
-
-        if (ret == 0) {
-            break;
-        }
-
-        current_buf += ret;
-        total_read += ret;
-        remaining_bytes -= ret;
+// [RULE 3] Robust I/O with Timeout - x prefix for utility functions
+static ssize_t xread_timeout(int fd, void *buffer, size_t count, int timeout_ms) {
+    char *buf = static_cast<char *>(buffer);
+    size_t remaining = count;
+    struct pollfd pfd = {fd, POLLIN, 0};
+    while (remaining > 0) {
+        if (poll(&pfd, 1, timeout_ms) <= 0) return -1;
+        ssize_t ret = TEMP_FAILURE_RETRY(read(fd, buf, remaining));
+        if (ret <= 0) return -1;
+        buf += ret;
+        remaining -= ret;
     }
-
-    return total_read;
+    return count - remaining;
 }
 
-static ssize_t xwrite(int fd, const void *buffer, size_t count_to_write) {
-    ssize_t total_written = 0;
-    const char *current_buf = static_cast<const char *>(buffer);
-    size_t remaining_bytes = count_to_write;
-
-    while (remaining_bytes > 0) {
-        ssize_t ret = TEMP_FAILURE_RETRY(write(fd, current_buf, remaining_bytes));
-
-        if (ret < 0) {
-            return -1;
-        }
-
-        if (ret == 0) {
-            break;
-        }
-
-        current_buf += ret;
-        total_written += ret;
-        remaining_bytes -= ret;
+static ssize_t xwrite_timeout(int fd, const void *buffer, size_t count, int timeout_ms) {
+    const char *buf = static_cast<const char *>(buffer);
+    size_t remaining = count;
+    struct pollfd pfd = {fd, POLLOUT, 0};
+    while (remaining > 0) {
+        if (poll(&pfd, 1, timeout_ms) <= 0) return -1;
+        ssize_t ret = TEMP_FAILURE_RETRY(write(fd, buf, remaining));
+        if (ret < 0) return -1;
+        buf += ret;
+        remaining -= ret;
     }
-
-    return total_written;
+    return count - remaining;
 }
 
-static bool copyFile(const std::string &from, const std::string &to, mode_t perms = 0777) {
-    return std::filesystem::exists(from) &&
-           std::filesystem::copy_file(
-                   from,
-                   to,
-                   std::filesystem::copy_options::overwrite_existing
-           ) &&
-           !chmod(
-                   to.c_str(),
-                   perms
-           );
-}
+// [OPTIMIZATION] Zero-Allocation Fingerprint Parser (Stack Based)
+static void parseFingerprintToProfile(DeviceProfile& profile) {
+    const char* fp = profile.FINGERPRINT;
+    size_t len = strlen(fp);
+    if (len == 0) return;
 
-static uint32_t crc32(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j)
-            crc = (crc >> 1) ^ (0xEDB88320U & (-(crc & 1)));
-    }
-    return ~crc;
-}
-
-static bool verifyModule(const char *path, const char *expected_hex) {
-    bool update = (access("/data/adb/modules/playintegrityfix/update", F_OK) == 0);
-    if (update)
-        return true;
-
-    int fd = open(path, O_RDWR);
-    if (fd < 0)
-        return false;
-
-    std::vector<uint8_t> buf;
-    uint8_t tmp[512];
-    ssize_t n;
-    while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
-        buf.insert(buf.end(), tmp, tmp + n);
-    }
-    if (buf.empty()) {
-        close(fd);
-        return false;
-    }
-
-    uint32_t crc = crc32(buf.data(), buf.size());
-    uint32_t expected_crc = 0;
-    sscanf(expected_hex, "%x", &expected_crc);
-
-    if (crc == expected_crc) {
-        close(fd);
-        return true;
-    }
-
-    LOGD("[COMPANION] module tampered!");
-
-    lseek(fd, 0, SEEK_SET);
-    std::vector<std::string> lines;
-    std::string file_str(buf.begin(), buf.end());
-    size_t pos = 0;
-    bool found = false;
-    while (pos < file_str.size()) {
-        size_t next = file_str.find('\n', pos);
-        std::string line = file_str.substr(pos, next - pos + 1);
-        if (line.rfind("description=", 0) == 0) {
-            line = "description=❌ This module has been tampered, please install from official source.\n";
-            found = true;
-        }
-        lines.push_back(line);
-        if (next == std::string::npos) break;
-        pos = next + 1;
-    }
-
-    if (ftruncate(fd, 0) != 0) {
-        close(fd);
-        return false;
-    }
-    lseek(fd, 0, SEEK_SET);
-    for (const auto &line : lines) {
-        if (write(fd, line.c_str(), line.size()) != (ssize_t)line.size()) {
-            close(fd);
-            return false;
+    const char* segments[8] = {nullptr};
+    size_t segLens[8] = {0};
+    int segCount = 0;
+    
+    const char* start = fp;
+    for (size_t i = 0; i <= len && segCount < 8; ++i) {
+        if (i == len || fp[i] == '/' || fp[i] == ':') {
+            if (i > static_cast<size_t>(start - fp)) {
+                segments[segCount] = start;
+                segLens[segCount] = i - (start - fp);
+                segCount++;
+            }
+            start = fp + i + 1;
         }
     }
+    
+    auto safeCopy = [](char* dest, const char* src, size_t srcLen, size_t destSize) {
+        size_t copyLen = (srcLen < destSize - 1) ? srcLen : destSize - 1;
+        memcpy(dest, src, copyLen);
+        dest[copyLen] = '\0';
+    };
+
+    if (segCount >= 8) {
+        safeCopy(profile.BRAND, segments[0], segLens[0], sizeof(profile.BRAND));
+        safeCopy(profile.PRODUCT, segments[1], segLens[1], sizeof(profile.PRODUCT));
+        safeCopy(profile.DEVICE, segments[2], segLens[2], sizeof(profile.DEVICE));
+        safeCopy(profile.RELEASE, segments[3], segLens[3], sizeof(profile.RELEASE));
+        safeCopy(profile.ID, segments[4], segLens[4], sizeof(profile.ID));
+        safeCopy(profile.INCREMENTAL, segments[5], segLens[5], sizeof(profile.INCREMENTAL));
+        safeCopy(profile.TYPE, segments[6], segLens[6], sizeof(profile.TYPE));
+        safeCopy(profile.TAGS, segments[7], segLens[7], sizeof(profile.TAGS));
+    }
+}
+
+// [SECURITY] Atomic Write + Chown + Symlink Protection
+static bool atomicWriteWithOwnership(const std::string& path, const void* data, size_t len, uid_t uid, gid_t gid) {
+    std::string tmpPath = path + ".tmp";
+    int fd = open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+
+    flock(fd, LOCK_EX);
+    if (fchown(fd, uid, gid) != 0) { close(fd); unlink(tmpPath.c_str()); return false; }
+
+    if (xwrite_timeout(fd, data, len, IPC_TIMEOUT_MS) != static_cast<ssize_t>(len)) {
+        close(fd); unlink(tmpPath.c_str()); return false;
+    }
+
+    fsync(fd);
+    flock(fd, LOCK_UN);
     close(fd);
+
+    if (rename(tmpPath.c_str(), path.c_str()) != 0) { unlink(tmpPath.c_str()); return false; }
+    return true;
+}
+
+// [SECURITY] Chunked Copy (Prevent OOM) - [RULE 3] 64KB Stack Buffer
+static bool copyFileWithOwnership(const std::string& src, const std::string& dst, 
+                                   uid_t uid, gid_t gid, off_t maxSize = MAX_LIB_SIZE) {
+    int srcFd = open(src.c_str(), O_RDONLY);
+    if (srcFd < 0) return false;
+
+    struct stat st;
+    if (fstat(srcFd, &st) != 0 || st.st_size > maxSize) { close(srcFd); return false; }
+    
+    std::string tmpPath = dst + ".tmp";
+    int dstFd = open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (dstFd < 0) { close(srcFd); return false; }
+    
+    if (fchown(dstFd, uid, gid) != 0) { 
+        close(srcFd); close(dstFd); unlink(tmpPath.c_str()); return false; 
+    }
+    
+    char buffer[65536]; // 64KB Stack Buffer - [RULE 3]
+    ssize_t totalRead = 0;
+    bool success = true;
+
+    while (totalRead < st.st_size) {
+        ssize_t toRead = (st.st_size - totalRead > 65536) ? 65536 : st.st_size - totalRead;
+        ssize_t nRead = xread_timeout(srcFd, buffer, toRead, IPC_TIMEOUT_MS);
+        if (nRead != toRead || xwrite_timeout(dstFd, buffer, nRead, IPC_TIMEOUT_MS) != nRead) {
+            success = false; break;
+        }
+        totalRead += nRead;
+    }
+    
+    close(srcFd);
+    fsync(dstFd);
+    close(dstFd);
+
+    if (success && rename(tmpPath.c_str(), dst.c_str()) == 0) return true;
+    unlink(tmpPath.c_str());
     return false;
 }
 
+// [RULE 5] Companion Logic - All file I/O happens here in root context
 static void companion(int fd) {
-    bool ok = true;
+    size_t pkgLen = 0, dirLen = 0;
+    uid_t appUid; gid_t appGid;
 
-    int size = 0;
-    xread(fd, &size, sizeof(int));
+    // Read package name
+    if (xread_timeout(fd, &pkgLen, sizeof(size_t), IPC_TIMEOUT_MS) != sizeof(size_t) || pkgLen > 256) return;
+    std::string packageName(pkgLen, '\0');
+    if (xread_timeout(fd, packageName.data(), pkgLen, IPC_TIMEOUT_MS) != static_cast<ssize_t>(pkgLen)) return;
 
-    std::string dir;
-    dir.resize(size);
-    auto bytes = xread(fd, dir.data(), size);
-    dir.resize(bytes);
-    dir.shrink_to_fit();
+    // Read app directory
+    if (xread_timeout(fd, &dirLen, sizeof(size_t), IPC_TIMEOUT_MS) != sizeof(size_t) || dirLen > 4096) return;
+    std::string appDir(dirLen, '\0');
+    if (xread_timeout(fd, appDir.data(), dirLen, IPC_TIMEOUT_MS) != static_cast<ssize_t>(dirLen)) return;
 
-    LOGD("[COMPANION] GMS dir: %s", dir.c_str());
+    // Read UID/GID for ownership transfer
+    if (xread_timeout(fd, &appUid, sizeof(uid_t), IPC_TIMEOUT_MS) != sizeof(uid_t)) return;
+    if (xread_timeout(fd, &appGid, sizeof(gid_t), IPC_TIMEOUT_MS) != sizeof(gid_t)) return;
 
-    auto libFile = dir + "/libinject.so";
+    bool shouldSpoof = false;
+    DeviceProfile profile = {};
+
+    // [RULE 3] File I/O with proper resource management
+    do {
+        int configFd = open(CONFIG_PATH, O_RDONLY);
+        if (configFd < 0) break;
+
+        struct stat st;
+        if (fstat(configFd, &st) != 0 || st.st_size <= 0 || st.st_size > MAX_CONFIG_SIZE) {
+            close(configFd);
+            break;
+        }
+
+        std::vector<char> buf(st.st_size);
+        ssize_t bytesRead = xread_timeout(configFd, buf.data(), st.st_size, IPC_TIMEOUT_MS);
+        close(configFd);  // [RULE 3] Always close immediately after read
+
+        if (bytesRead != st.st_size) break;
+
+        nlohmann::json json = nlohmann::json::parse(buf.begin(), buf.end(), nullptr, false);
+        if (json.is_discarded() || !json.is_object()) break;
+
+        // Search for matching package
+        for (auto& [key, value] : json.items()) {
+            if (!key.starts_with("PACKAGES_") || key.ends_with("_DEVICE") || !value.is_array()) continue;
+
+            for (const auto& pkg : value) {
+                if (pkg != packageName) continue;
+
+                shouldSpoof = true;
+                std::string deviceKey = key + "_DEVICE";
+                if (json.contains(deviceKey)) {
+                    const auto& dev = json[deviceKey];
+                    strncpy(profile.profileName, key.substr(9).c_str(), 63);
+                    if (dev.contains("MANUFACTURER")) strncpy(profile.MANUFACTURER, dev["MANUFACTURER"].get<std::string>().c_str(), 63);
+                    if (dev.contains("MODEL")) strncpy(profile.MODEL, dev["MODEL"].get<std::string>().c_str(), 63);
+                    if (dev.contains("FINGERPRINT")) strncpy(profile.FINGERPRINT, dev["FINGERPRINT"].get<std::string>().c_str(), 255);
+                    profile.debugMode = dev.value("DEBUG", false);
+                    
+                    // Parse GPS config
+                    if (dev.contains("GPS") && dev["GPS"].is_object()) {
+                        const auto& gps = dev["GPS"];
+                        profile.gpsEnabled = gps.value("enabled", false);
+                        profile.gpsLatitude = gps.value("latitude", 0.0);
+                        profile.gpsLongitude = gps.value("longitude", 0.0);
+                        profile.gpsAccuracy = gps.value("accuracy", 5.0f);
+                        LOGD("[COMPANION] GPS Config: enabled=%d, lat=%.6f, lon=%.6f, acc=%.1f",
+                             profile.gpsEnabled, profile.gpsLatitude, profile.gpsLongitude, profile.gpsAccuracy);
+                    }
+                    
+                    parseFingerprintToProfile(profile);
+                }
+                break;
+            }
+            if (shouldSpoof) break;
+        }
+    } while (false);
+
+    // Send decision to module
+    xwrite_timeout(fd, &shouldSpoof, sizeof(bool), IPC_TIMEOUT_MS);
+    if (!shouldSpoof) return;
+
+    // Copy files to app directory with proper ownership
+    std::string libDest = appDir + "/libinject.so";
+    std::string profDest = appDir + "/device_profile.bin";
+
 #if defined(__aarch64__)
-    ok &= copyFile(LIB_64, libFile);
-#elif defined(__arm__)
-    ok &= copyFile(LIB_32, libFile);
+    bool ok = copyFileWithOwnership(INJECT_LIB_64, libDest, appUid, appGid);
+#else
+    bool ok = copyFileWithOwnership(INJECT_LIB_32, libDest, appUid, appGid);
 #endif
 
-    LOGD("[COMPANION] copied inject lib");
+    ok &= atomicWriteWithOwnership(profDest, &profile, sizeof(DeviceProfile), appUid, appGid);
 
-    auto dexFile = dir + "/classes.dex";
-    ok &= copyFile(DEX_PATH, dexFile, 0644);
-
-    LOGD("[COMPANION] copied dex");
-
-    auto pifFile = dir + "/pif.prop";
-    if (!copyFile(CUSTOM_PIF, pifFile)) {
-        if (!copyFile(DEFAULT_PIF, pifFile)) {
+    // Copy GPS DEX if GPS is enabled
+    if (ok && profile.gpsEnabled) {
+        std::string gpsDexDest = appDir + "/gps_classes.dex";
+        if (access(GPS_DEX_PATH, F_OK) == 0) {
+            ok &= copyFileWithOwnership(GPS_DEX_PATH, gpsDexDest, appUid, appGid, MAX_DEX_SIZE);
+            if (ok) {
+                LOGD("[COMPANION] GPS DEX copied to %s", gpsDexDest.c_str());
+            } else {
+                LOGE("[COMPANION] Failed to copy GPS DEX");
+            }
+        } else {
+            LOGE("[COMPANION] GPS DEX not found at %s", GPS_DEX_PATH);
             ok = false;
         }
     }
 
-    LOGD("[COMPANION] copied pif");
-
-    ok &= verifyModule(MODULE_PROP, MODULE_PROP_CHECKSUM_HEX);
-
-    LOGD("[COMPANION] verified module.prop");
-
-    xwrite(fd, &ok, sizeof(bool));
+    xwrite_timeout(fd, &ok, sizeof(bool), IPC_TIMEOUT_MS);
 }
 
+// [RULE 1] Zygisk Module Implementation
 using namespace zygisk;
 
-class PlayIntegrityFix : public ModuleBase {
+class SpoofXManager : public ModuleBase {
 public:
-    void onLoad(Api *api_, JNIEnv *env_) override {
-        this->api = api_;
-        this->env = env_;
+    void onLoad(Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
     }
 
+    // [RULE 1] Early Exit - All filtering in preAppSpecialize
     void preAppSpecialize(AppSpecializeArgs *args) override {
-        api->setOption(DLCLOSE_MODULE_LIBRARY);
-
-        if (!args)
-            return;
-
-        bool scriptOnly = (access("/data/adb/pif_script_only", F_OK) == 0);
-
-        if (scriptOnly)
-            return;
-
-        std::string dir, name;
-
-        auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
-
-        if (rawDir) {
-            dir = rawDir;
-            env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+        if (!args || !args->app_data_dir || !args->nice_name) {
+            api->setOption(DLCLOSE_MODULE_LIBRARY); return;
         }
 
-        auto rawName = env->GetStringUTFChars(args->nice_name, nullptr);
-
-        if (rawName) {
-            name = rawName;
-            env->ReleaseStringUTFChars(args->nice_name, rawName);
-        }
-
-        std::string_view vDir(dir);
-        bool isGms =
-                vDir.ends_with("/com.google.android.gms") || vDir.ends_with("/com.android.vending");
-
-        if (!isGms)
-            return;
-
-        api->setOption(FORCE_DENYLIST_UNMOUNT);
-
-        std::string_view vName(name);
-        isGmsUnstable = vName == DROIDGUARD_PACKAGE;
-        isVending = vName == VENDING_PACKAGE;
-
-        if (!isGmsUnstable && !isVending) {
+        // [RULE 3] JNI Exception Safety
+        const char *rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
+        if (env->ExceptionCheck() || !rawDir) {
+            env->ExceptionClear();
             api->setOption(DLCLOSE_MODULE_LIBRARY);
             return;
         }
+        std::string dir(rawDir);
+        env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
 
-        auto fd = api->connectCompanion();
+        const char *rawPkg = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (env->ExceptionCheck() || !rawPkg) {
+            env->ExceptionClear();
+            api->setOption(DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        std::string pkg(rawPkg);
+        env->ReleaseStringUTFChars(args->nice_name, rawPkg);
 
-        int size = static_cast<int>(dir.size());
-        xwrite(fd, &size, sizeof(int));
+        int fd = api->connectCompanion();
+        if (fd < 0) { api->setOption(DLCLOSE_MODULE_LIBRARY); return; }
 
-        xwrite(fd, dir.data(), size);
+        size_t pkgLen = pkg.size(), dirLen = dir.size();
+        uid_t uid = args->uid; gid_t gid = args->gid;
 
-        bool ok = false;
-        xread(fd, &ok, sizeof(bool));
+        // [RULE 3] Timeout-based IPC
+        if (xwrite_timeout(fd, &pkgLen, sizeof(size_t), IPC_TIMEOUT_MS) < 0 ||
+            xwrite_timeout(fd, pkg.data(), pkgLen, IPC_TIMEOUT_MS) < 0 ||
+            xwrite_timeout(fd, &dirLen, sizeof(size_t), IPC_TIMEOUT_MS) < 0 ||
+            xwrite_timeout(fd, dir.data(), dirLen, IPC_TIMEOUT_MS) < 0 ||
+            xwrite_timeout(fd, &uid, sizeof(uid_t), IPC_TIMEOUT_MS) < 0 ||
+            xwrite_timeout(fd, &gid, sizeof(gid_t), IPC_TIMEOUT_MS) < 0) {
+            close(fd); api->setOption(DLCLOSE_MODULE_LIBRARY); return;
+        }
 
+        bool shouldSpoof = false;
+        if (xread_timeout(fd, &shouldSpoof, sizeof(bool), IPC_TIMEOUT_MS) != sizeof(bool)) shouldSpoof = false;
+
+        // [RULE 1] Early Exit if not target
+        if (!shouldSpoof) {
+            close(fd); api->setOption(DLCLOSE_MODULE_LIBRARY); return;
+        }
+
+        bool ready = false;
+        if (xread_timeout(fd, &ready, sizeof(bool), IPC_TIMEOUT_MS) != sizeof(bool)) ready = false;
         close(fd);
 
-        if (ok)
-            gmsDir = dir;
-    }
-
-    void postAppSpecialize(const AppSpecializeArgs *args) override {
-        if (gmsDir.empty())
-            return;
-
-        typedef bool (*InitFuncPtr)(JavaVM *, const std::string &, bool, bool);
-
-        void *handle = dlopen((gmsDir + "/libinject.so").c_str(), RTLD_NOW);
-
-        if (!handle)
-            return;
-
-        auto init_func = reinterpret_cast<InitFuncPtr>(dlsym(handle, "init"));
-
-        JavaVM *vm = nullptr;
-        env->GetJavaVM(&vm);
-
-        if (init_func(vm, gmsDir, isGmsUnstable, isVending)) {
-            LOGD("dlclose injected lib");
-            dlclose(handle);
+        if (ready) {
+            appDir = dir;
+            api->setOption(FORCE_DENYLIST_UNMOUNT);
+        } else {
+            api->setOption(DLCLOSE_MODULE_LIBRARY);
         }
     }
 
+    void postAppSpecialize(const AppSpecializeArgs *args) override {
+        if (appDir.empty()) return;
+
+        std::string libPath = appDir + "/libinject.so";
+        void *handle = dlopen(libPath.c_str(), RTLD_NOW);
+        if (!handle) { 
+            LOGE("dlopen failed: %s", dlerror()); 
+            return; 
+        }
+
+        // [RULE 4] Clear naming for init function
+        auto initFn = reinterpret_cast<bool (*)(JNIEnv*, const std::string&)>(dlsym(handle, "init"));
+        if (initFn) {
+            initFn(env, appDir);
+        } else {
+            LOGE("dlsym 'init' failed");
+        }
+    }
+
+    // [RULE 1] Always detach from system server
     void preServerSpecialize(ServerSpecializeArgs *args) override {
         api->setOption(DLCLOSE_MODULE_LIBRARY);
     }
@@ -303,11 +391,8 @@ public:
 private:
     Api *api = nullptr;
     JNIEnv *env = nullptr;
-    std::string gmsDir;
-    bool isGmsUnstable = false;
-    bool isVending = false;
+    std::string appDir;
 };
 
-REGISTER_ZYGISK_MODULE(PlayIntegrityFix)
-
+REGISTER_ZYGISK_MODULE(SpoofXManager)
 REGISTER_ZYGISK_COMPANION(companion)
