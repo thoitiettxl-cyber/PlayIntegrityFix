@@ -1,392 +1,397 @@
-#include "dobby.h"
+// inject.cpp - SpoofXManager v7.2.0 - GPS DEX Injection Support
+// [RULE 1-5 COMPLIANT]
 #include <android/log.h>
-#include <jni.h>
 #include <sys/system_properties.h>
-#include <unordered_map>
-#include <vector>
+#include <jni.h>
+#include <string>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <atomic>
+#include <string_view>
+#include <cstdlib>
+#include <cerrno>
+#include <poll.h>
+#include "dobby.h"
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PIF", __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "SpoofX-Inject", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SpoofX-Inject", __VA_ARGS__)
 
-static std::string dir;
-static JNIEnv *env;
-static bool isGmsUnstable = false;
-static bool isVending = false;
+#define FILE_IO_TIMEOUT_MS 200
 
-static std::unordered_map<std::string, std::string> propMap;
+// [PROTOCOL] Must match zygisk.cpp definition exactly
+struct DeviceProfile {
+    char profileName[64];
+    char MANUFACTURER[64];
+    char MODEL[64];
+    char FINGERPRINT[256];
+    char BRAND[64];
+    char PRODUCT[64];
+    char DEVICE[64];
+    char RELEASE[32];
+    char ID[64];
+    char INCREMENTAL[64];
+    char TYPE[32];
+    char TAGS[32];
+    bool debugMode;
+    // GPS Spoofing Fields
+    double gpsLatitude;
+    double gpsLongitude;
+    float gpsAccuracy;
+    bool gpsEnabled;
+};
 
-static bool spoofBuild = true, spoofProps = true, spoofProvider = false, spoofSignature = false;
+// [RULE 3] Robust I/O Wrapper with Timeout
+static ssize_t xread_timeout(int fd, void *buffer, size_t count, int timeout_ms) {
+    char *buf = static_cast<char *>(buffer);
+    size_t remaining = count;
+    struct pollfd pfd = {fd, POLLIN, 0};
+    while (remaining > 0) {
+        if (poll(&pfd, 1, timeout_ms) <= 0) return -1;
+        ssize_t ret = TEMP_FAILURE_RETRY(read(fd, buf, remaining));
+        if (ret <= 0) return -1;
+        buf += ret;
+        remaining -= ret;
+    }
+    return count - remaining;
+}
 
-static bool DEBUG = false;
-static std::string DEVICE_INITIAL_SDK_INT = "21", SECURITY_PATCH, BUILD_ID;
-static bool spoofVendingSdk = false, spoofVendingBuild = false;
+// [RULE 2] Static State & Atomic Callback
+class SpoofState {
+public:
+    static DeviceProfile profile;
+    static std::atomic<bool> isActive;
+};
+DeviceProfile SpoofState::profile = {};
+std::atomic<bool> SpoofState::isActive{false};
 
-typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
+// [RULE 2] Atomic callback pointers - Thread Safety
+using T_Callback = void (*)(void *, const char *, const char *, uint32_t);
+using T_SysPropRead = void (*)(prop_info *, T_Callback, void *);
 
-static T_Callback o_callback = nullptr;
+static std::atomic<T_Callback> o_callback{nullptr};
+static std::atomic<T_SysPropRead> o_system_property_read_callback{nullptr};
 
-static void modify_callback(void *cookie, const char *name, const char *value,
-                            uint32_t serial) {
+// Validation Logic
+static bool validateAppDirectory(const std::string& appDir) {
+    if (appDir.find("/data/") != 0) return false;
+    if (appDir.length() > 256) return false;
+    if (appDir.find("/data/system") == 0 || appDir.find("/data/app/") == 0) return false;
+    return true;
+}
 
-    if (!cookie || !name || !value || !o_callback)
-        return;
+static bool validateFingerprint(const DeviceProfile& profile) {
+    std::string_view fp(profile.FINGERPRINT);
+    if (fp.length() < 10 || fp.length() > 255) return false;
+    
+    int slashes = 0, colons = 0;
+    for (char c : fp) {
+        if (c == '/') slashes++;
+        else if (c == ':') colons++;
+    }
+    return (slashes >= 5 && colons >= 2);
+}
 
-    const char *oldValue = value;
-
+// [RULE 4] my_ prefix for hook replacement
+static void my_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
+    T_Callback original = o_callback.load(std::memory_order_relaxed);
+    if (!original || !cookie || !name || !value) return;
+    
     std::string_view prop(name);
+    const char* spoofedVal = value;
 
-    if (prop == "init.svc.adbd") {
-        value = "stopped";
-    } else if (prop == "sys.usb.state") {
-        value = "mtp";
-    } else if (prop.ends_with("api_level")) {
-        if (!DEVICE_INITIAL_SDK_INT.empty()) {
-            value = DEVICE_INITIAL_SDK_INT.c_str();
-        }
-    } else if (prop.ends_with(".security_patch")) {
-        if (!SECURITY_PATCH.empty()) {
-            value = SECURITY_PATCH.c_str();
-        }
-    } else if (prop.ends_with(".build.id")) {
-        if (!BUILD_ID.empty()) {
-            value = BUILD_ID.c_str();
-        }
+    if (SpoofState::isActive.load(std::memory_order_relaxed)) {
+        if (prop == "init.svc.adbd") spoofedVal = "stopped";
+        else if (prop == "sys.usb.state") spoofedVal = "mtp";
+        else if (prop.ends_with(".manufacturer")) spoofedVal = SpoofState::profile.MANUFACTURER;
+        else if (prop.ends_with(".model")) spoofedVal = SpoofState::profile.MODEL;
+        else if (prop.ends_with(".fingerprint")) spoofedVal = SpoofState::profile.FINGERPRINT;
+        else if (prop.ends_with(".brand")) spoofedVal = SpoofState::profile.BRAND;
+        else if (prop.ends_with(".product")) spoofedVal = SpoofState::profile.PRODUCT;
+        else if (prop.ends_with(".device")) spoofedVal = SpoofState::profile.DEVICE;
+        else if (prop.ends_with(".release")) spoofedVal = SpoofState::profile.RELEASE;
+        else if (prop.ends_with(".build.id")) spoofedVal = SpoofState::profile.ID;
+        else if (prop.ends_with(".incremental")) spoofedVal = SpoofState::profile.INCREMENTAL;
+        else if (prop.ends_with(".type")) spoofedVal = SpoofState::profile.TYPE;
+        else if (prop.ends_with(".tags")) spoofedVal = SpoofState::profile.TAGS;
     }
 
-    if (strcmp(oldValue, value) == 0) {
-        if (DEBUG)
-            LOGD("[%s]: %s (unchanged)", name, oldValue);
-    } else {
-        LOGD("[%s]: %s -> %s", name, oldValue, value);
+    if (SpoofState::profile.debugMode && strcmp(value, spoofedVal) != 0) {
+        LOGD("[%s] %s -> %s", SpoofState::profile.profileName, name, spoofedVal);
     }
 
-    return o_callback(cookie, name, value, serial);
+    original(cookie, name, spoofedVal, serial);
 }
 
-static void (*o_system_property_read_callback)(prop_info *, T_Callback,
-                                               void *) = nullptr;
-
-static void my_system_property_read_callback(prop_info *pi, T_Callback callback,
-                                             void *cookie) {
-    if (pi && callback && cookie)
-        o_callback = callback;
-    return o_system_property_read_callback(pi, modify_callback, cookie);
-}
-
-static bool doHook() {
-    void *ptr = DobbySymbolResolver(nullptr, "__system_property_read_callback");
-
-    if (ptr && DobbyHook(ptr, (void *) my_system_property_read_callback,
-                         (void **) &o_system_property_read_callback) == 0) {
-        LOGD("hook __system_property_read_callback successful at %p", ptr);
-        return true;
+// [RULE 4] my_ prefix for hook replacement
+static void my_system_property_read_callback(prop_info *pi, T_Callback callback, void *cookie) {
+    if (pi && callback && cookie) {
+        o_callback.store(callback, std::memory_order_relaxed);
     }
-
-    LOGE("hook __system_property_read_callback failed!");
-    return false;
-}
-
-static void doSpoofVending() {
-    int requestSdk = 32;
-    int targetSdk;
-    int oldValue;
-
-    jclass buildVersionClass = nullptr;
-    jfieldID sdkIntFieldID = nullptr;
-
-    buildVersionClass = env->FindClass("android/os/Build$VERSION");
-    if (buildVersionClass == nullptr) {
-        LOGE("Build.VERSION class not found");
-        env->ExceptionClear();
-        return;
-    }
-
-    sdkIntFieldID = env->GetStaticFieldID(buildVersionClass, "SDK_INT", "I");
-    if (sdkIntFieldID == nullptr) {
-        LOGE("SDK_INT field not found");
-        env->ExceptionClear();
-        env->DeleteLocalRef(buildVersionClass);
-        return;
-    }
-
-    oldValue = env->GetStaticIntField(buildVersionClass, sdkIntFieldID);
-    targetSdk = std::min(oldValue, requestSdk);
-
-    if (oldValue == targetSdk) {
-        env->DeleteLocalRef(buildVersionClass);
-        return;
-    }
-
-    env->SetStaticIntField(buildVersionClass, sdkIntFieldID, targetSdk);
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        LOGE("SDK_INT field not accessible (JNI Exception)");
-    } else {
-        LOGE("[SDK_INT]: %d -> %d", oldValue, targetSdk);
-    }
-
-    env->DeleteLocalRef(buildVersionClass);
-}
-
-static void parsePropFile(const std::string& path) {
-    propMap.clear();
-    FILE* file = fopen(path.c_str(), "r");
-    if (!file) return;
-    char buf[512];
-    while (fgets(buf, sizeof(buf), file)) {
-        std::string line(buf);
-        auto comment = line.find('#');
-        if (comment != std::string::npos) line = line.substr(0, comment);
-        line.erase(0, line.find_first_not_of(" \t\r\n"));
-        line.erase(line.find_last_not_of(" \t\r\n") + 1);
-        if (line.empty()) continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key = line.substr(0, eq);
-        std::string value = line.substr(eq + 1);
-        propMap[key] = value;
-    }
-    fclose(file);
-}
-
-static void parseProps() {
-    if (propMap.count("spoofVendingSdk")) {
-        std::string v = propMap["spoofVendingSdk"];
-        spoofVendingSdk = (v == "1" || v == "true");
-        propMap.erase("spoofVendingSdk");
-    }
-    if (propMap.count("spoofVendingBuild")) {
-        std::string v = propMap["spoofVendingBuild"];
-        spoofVendingBuild = (v == "1" || v == "true");
-        propMap.erase("spoofVendingBuild");
-    }
-    if (propMap.count("DEVICE_INITIAL_SDK_INT")) {
-        DEVICE_INITIAL_SDK_INT = propMap["DEVICE_INITIAL_SDK_INT"];
-        propMap.erase("DEVICE_INITIAL_SDK_INT");
-    }
-    if (propMap.count("spoofBuild")) {
-        std::string v = propMap["spoofBuild"];
-        spoofBuild = (v == "1" || v == "true");
-        propMap.erase("spoofBuild");
-    }
-    if (propMap.count("spoofProvider")) {
-        std::string v = propMap["spoofProvider"];
-        spoofProvider = (v == "1" || v == "true");
-        propMap.erase("spoofProvider");
-    }
-    if (propMap.count("spoofProps")) {
-        std::string v = propMap["spoofProps"];
-        spoofProps = (v == "1" || v == "true");
-        propMap.erase("spoofProps");
-    }
-    if (propMap.count("spoofSignature")) {
-        std::string v = propMap["spoofSignature"];
-        spoofSignature = (v == "1" || v == "true");
-        propMap.erase("spoofSignature");
-    }
-    if (propMap.count("DEBUG")) {
-        std::string v = propMap["DEBUG"];
-        DEBUG = (v == "1" || v == "true");
-        propMap.erase("DEBUG");
-    }
-    if (propMap.count("FINGERPRINT")) {
-        std::string fingerprint = propMap["FINGERPRINT"];
-        std::vector<std::string> vector;
-        size_t start = 0, end;
-        while ((end = fingerprint.find('/', start)) != std::string::npos) {
-            std::string part = fingerprint.substr(start, end - start);
-            size_t sub_start = 0, sub_end;
-            while ((sub_end = part.find(':', sub_start)) != std::string::npos) {
-                vector.push_back(part.substr(sub_start, sub_end - sub_start));
-                sub_start = sub_end + 1;
-            }
-            vector.push_back(part.substr(sub_start));
-            start = end + 1;
-        }
-        std::string part = fingerprint.substr(start);
-        size_t sub_start = 0, sub_end;
-        while ((sub_end = part.find(':', sub_start)) != std::string::npos) {
-            vector.push_back(part.substr(sub_start, sub_end - sub_start));
-            sub_start = sub_end + 1;
-        }
-        vector.push_back(part.substr(sub_start));
-
-        static const char* keys[] = {
-            "BRAND",
-            "PRODUCT",
-            "DEVICE",
-            "RELEASE",
-            "ID",
-            "INCREMENTAL",
-            "TYPE",
-            "TAGS"
-        };
-        for (size_t i = 0; i < 8; ++i) {
-            propMap[keys[i]] = (i < vector.size()) ? vector[i] : "";
-        }
-    }
-    if (propMap.count("SECURITY_PATCH")) {
-        SECURITY_PATCH = propMap["SECURITY_PATCH"];
-    }
-    if (propMap.count("ID")) {
-        BUILD_ID = propMap["ID"];
+    
+    auto orig = o_system_property_read_callback.load(std::memory_order_relaxed);
+    if (orig) {
+        orig(pi, my_callback, cookie);
     }
 }
 
-static void UpdateBuildFields() {
-    jclass buildClass = env->FindClass("android/os/Build");
-    jclass versionClass = env->FindClass("android/os/Build$VERSION");
-    for (const auto& [key, val] : propMap) {
-        const char *fieldName = key.c_str();
+// [RULE 3] JNI Helper with Push/Pop LocalFrame for memory safety
+class JNIHelper {
+    JNIEnv* env;
+public:
+    explicit JNIHelper(JNIEnv* e) : env(e) {}
+    
+    bool setField(const char* clsName, const char* field, const char* val) {
+        if (!val || strlen(val) == 0) return true;
+        
+        if (env->PushLocalFrame(16) < 0) return false;
 
-        jfieldID fieldID =
-                env->GetStaticFieldID(buildClass, fieldName, "Ljava/lang/String;");
+        bool result = true;
+        do {
+            jclass cls = env->FindClass(clsName);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); result = false; break; }
+            
+            jfieldID fid = env->GetStaticFieldID(cls, field, "Ljava/lang/String;");
+            if (env->ExceptionCheck()) { env->ExceptionClear(); result = false; break; }
+            
+            jstring jStr = env->NewStringUTF(val);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); result = false; break; }
+            
+            env->SetStaticObjectField(cls, fid, jStr);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); }
+        } while (false);
 
-        if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-
-            fieldID =
-                    env->GetStaticFieldID(versionClass, fieldName, "Ljava/lang/String;");
-
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                continue;
-            }
-        }
-
-        if (fieldID != nullptr) {
-            const char *value = val.c_str();
-            jstring jValue = env->NewStringUTF(value);
-
-            env->SetStaticObjectField(buildClass, fieldID, jValue);
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                continue;
-            }
-
-            LOGD("Set '%s' to '%s'", fieldName, value);
-        }
+        env->PopLocalFrame(nullptr);
+        return result;
     }
-}
+};
 
-static std::string propMapToJson() {
-    std::string json = "{";
-    bool first = true;
-    for (const auto& [k, v] : propMap) {
-        if (!first) json += ",";
-        first = false;
-        json += "\"" + k + "\":\"" + v + "\"";
+// ============================================================================
+// GPS DEX INJECTION - Following PlayIntegrityFix Pattern
+// ============================================================================
+
+/**
+ * [RULE 3] Inject GPS DEX and call GpsSpoofingEngine.initialize()
+ * Uses PathClassLoader following PlayIntegrityFix architecture
+ * 
+ * @param env JNI Environment
+ * @param appDir Application data directory containing gps_classes.dex
+ * @param lat Target latitude
+ * @param lon Target longitude  
+ * @param accuracy GPS accuracy in meters
+ * @return true if injection successful
+ */
+static bool injectGpsDex(JNIEnv* env, const std::string& appDir, 
+                          double lat, double lon, float accuracy) {
+    
+    // [RULE 3] Use PushLocalFrame to prevent JNI reference leak
+    if (env->PushLocalFrame(32) < 0) {
+        LOGE("GPS: PushLocalFrame failed");
+        return false;
     }
-    json += "}";
-    return json;
-}
-
-static void injectDex() {
-    LOGD("get system classloader");
-    auto clClass = env->FindClass("java/lang/ClassLoader");
-    auto getSystemClassLoader = env->GetStaticMethodID(
+    
+    bool success = false;
+    
+    do {
+        // Step 1: Get system ClassLoader
+        jclass clClass = env->FindClass("java/lang/ClassLoader");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionDescribe();
+            env->ExceptionClear(); 
+            LOGE("GPS: ClassLoader class not found");
+            break; 
+        }
+        
+        jmethodID getSystemClassLoader = env->GetStaticMethodID(
             clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
-    auto systemClassLoader =
-            env->CallStaticObjectMethod(clClass, getSystemClassLoader);
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        return;
-    }
-
-    LOGD("create class loader");
-    auto dexClClass = env->FindClass("dalvik/system/PathClassLoader");
-    auto dexClInit = env->GetMethodID(
-            dexClClass, "<init>",
-            "(Ljava/lang/String;Ljava/lang/ClassLoader;)V");
-    auto classesJar = env->NewStringUTF((dir + "/classes.dex").c_str());
-    auto dexCl =
-            env->NewObject(dexClClass, dexClInit, classesJar, systemClassLoader);
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        return;
-    }
-
-    LOGD("load class");
-    auto loadClass = env->GetMethodID(clClass, "loadClass",
-                                      "(Ljava/lang/String;)Ljava/lang/Class;");
-    auto entryClassName =
-            env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPoint");
-    auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
-    auto entryPointClass = (jclass) entryClassObj;
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        return;
-    }
-
-    LOGD("call init");
-    auto entryInit = env->GetStaticMethodID(entryPointClass, "init",
-                                            "(Ljava/lang/String;ZZZ)V");
-    auto jsonStr = env->NewStringUTF(propMapToJson().c_str());
-    env->CallStaticVoidMethod(entryPointClass, entryInit, jsonStr, spoofProvider,
-                              spoofSignature, spoofBuild);
-
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    env->DeleteLocalRef(entryClassName);
-    env->DeleteLocalRef(entryClassObj);
-    env->DeleteLocalRef(jsonStr);
-    env->DeleteLocalRef(dexCl);
-    env->DeleteLocalRef(classesJar);
-    env->DeleteLocalRef(dexClClass);
-    env->DeleteLocalRef(systemClassLoader);
-    env->DeleteLocalRef(clClass);
-
-    LOGD("jni memory free");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            LOGE("GPS: getSystemClassLoader not found");
+            break; 
+        }
+        
+        jobject systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+        if (env->ExceptionCheck()) { 
+            env->ExceptionDescribe();
+            env->ExceptionClear(); 
+            LOGE("GPS: getSystemClassLoader call failed");
+            break; 
+        }
+        
+        // Step 2: Create PathClassLoader for GPS DEX
+        jclass dexClClass = env->FindClass("dalvik/system/PathClassLoader");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            LOGE("GPS: PathClassLoader class not found");
+            break; 
+        }
+        
+        jmethodID dexClInit = env->GetMethodID(
+            dexClClass, "<init>", "(Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            LOGE("GPS: PathClassLoader constructor not found");
+            break; 
+        }
+        
+        std::string dexPath = appDir + "/gps_classes.dex";
+        jstring jDexPath = env->NewStringUTF(dexPath.c_str());
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            break; 
+        }
+        
+        jobject dexClassLoader = env->NewObject(dexClClass, dexClInit, jDexPath, systemClassLoader);
+        if (env->ExceptionCheck()) { 
+            env->ExceptionDescribe();
+            env->ExceptionClear(); 
+            LOGE("GPS: Failed to create PathClassLoader for %s", dexPath.c_str());
+            break; 
+        }
+        
+        LOGD("GPS: PathClassLoader created for %s", dexPath.c_str());
+        
+        // Step 3: Load GpsSpoofingEngine class
+        jmethodID loadClass = env->GetMethodID(
+            clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            LOGE("GPS: loadClass method not found");
+            break; 
+        }
+        
+        jstring className = env->NewStringUTF("es.thoitiet.spooxmanager.GpsSpoofingEngine");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            break; 
+        }
+        
+        jobject entryClassObj = env->CallObjectMethod(dexClassLoader, loadClass, className);
+        if (env->ExceptionCheck()) { 
+            env->ExceptionDescribe();
+            env->ExceptionClear(); 
+            LOGE("GPS: Failed to load GpsSpoofingEngine class");
+            break; 
+        }
+        
+        auto gpsEngineClass = static_cast<jclass>(entryClassObj);
+        
+        LOGD("GPS: GpsSpoofingEngine class loaded");
+        
+        // Step 4: Call static initialize(double, double, float)
+        jmethodID initMethod = env->GetStaticMethodID(
+            gpsEngineClass, "initialize", "(DDF)V");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            LOGE("GPS: initialize method not found");
+            break; 
+        }
+        
+        env->CallStaticVoidMethod(gpsEngineClass, initMethod, 
+                                   static_cast<jdouble>(lat), 
+                                   static_cast<jdouble>(lon), 
+                                   static_cast<jfloat>(accuracy));
+        if (env->ExceptionCheck()) { 
+            env->ExceptionDescribe();
+            env->ExceptionClear(); 
+            LOGE("GPS: initialize call failed");
+            break; 
+        }
+        
+        LOGD("GPS: GpsSpoofingEngine.initialize(%.6f, %.6f, %.1f) called successfully", 
+             lat, lon, accuracy);
+        success = true;
+        
+    } while (false);
+    
+    // [RULE 3] Always pop frame to clean up local references
+    env->PopLocalFrame(nullptr);
+    
+    return success;
 }
 
-extern "C" [[gnu::visibility("default"), maybe_unused]] bool
-init(JavaVM *vm, const std::string &gmsDir, bool isGmsUnstable, bool isVending) {
-    ::isGmsUnstable = isGmsUnstable;
-    ::isVending = isVending;
+// ============================================================================
+// MAIN INIT FUNCTION
+// ============================================================================
 
-    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        LOGE("[INJECT] JNI_ERR!");
-        return true;
+extern "C" [[gnu::visibility("default")]] bool init(JNIEnv* env, const std::string& appDir) {
+    if (!validateAppDirectory(appDir)) {
+        LOGE("INIT FAILED: Invalid App Directory: %s", appDir.c_str());
+        return false;
     }
 
-    dir = gmsDir;
-    LOGD("[INJECT] GMS dir: %s", dir.c_str());
+    // Load Profile
+    std::string path = appDir + "/device_profile.bin";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        LOGE("INIT FAILED: Cannot open profile at %s", path.c_str());
+        return false;
+    }
 
-    parsePropFile(dir + "/pif.prop");
-    parseProps();
+    // [RULE 3] Use robust timeout read
+    if (xread_timeout(fd, &SpoofState::profile, sizeof(DeviceProfile), FILE_IO_TIMEOUT_MS) 
+            != sizeof(DeviceProfile)) {
+        LOGE("INIT FAILED: Profile read size mismatch or timeout");
+        close(fd);
+        return false;
+    }
+    close(fd);
 
-    if (isGmsUnstable) {
-        if (spoofBuild) {
-            UpdateBuildFields();
-        }
+    if (!validateFingerprint(SpoofState::profile)) {
+        LOGE("INIT FAILED: Invalid Fingerprint structure: %s", SpoofState::profile.FINGERPRINT);
+        return false;
+    }
 
-        if (spoofProvider || spoofSignature) {
-            injectDex();
+    // [RULE 2] Use atomic store
+    SpoofState::isActive.store(true, std::memory_order_relaxed);
+    
+    // Safety: Dummy callback init
+    static T_Callback dummy = [](void*, const char*, const char*, uint32_t){};
+    o_callback.store(dummy, std::memory_order_relaxed);
+
+    // Install Property Hook
+    void *sym = DobbySymbolResolver(nullptr, "__system_property_read_callback");
+    if (sym) {
+        void* trampoline_stub = nullptr;
+        int ret = DobbyHook(sym, (void *)my_system_property_read_callback, &trampoline_stub);
+        if (ret == 0) {
+            o_system_property_read_callback.store(
+                reinterpret_cast<T_SysPropRead>(trampoline_stub), 
+                std::memory_order_relaxed);
+            LOGD("Property hook installed successfully");
         } else {
-            LOGD("[INJECT] Dex file won't be injected due spoofProvider and spoofSignature are false");
+            LOGE("DobbyHook failed with code: %d", ret);
         }
+    } else {
+        LOGE("FATAL: Could not resolve __system_property_read_callback");
+    }
 
-        if (spoofProps) {
-            return !doHook();
-        }
-    } else if (isVending) {
-        if (spoofVendingBuild) {
-            UpdateBuildFields();
-        } else if (spoofVendingSdk) {
-            doSpoofVending();
+    // JNI Build Field Updates
+    JNIHelper jni(env);
+    jni.setField("android/os/Build", "MANUFACTURER", SpoofState::profile.MANUFACTURER);
+    jni.setField("android/os/Build", "MODEL", SpoofState::profile.MODEL);
+    jni.setField("android/os/Build", "FINGERPRINT", SpoofState::profile.FINGERPRINT);
+    jni.setField("android/os/Build", "BRAND", SpoofState::profile.BRAND);
+    jni.setField("android/os/Build", "PRODUCT", SpoofState::profile.PRODUCT);
+    jni.setField("android/os/Build", "DEVICE", SpoofState::profile.DEVICE);
+    jni.setField("android/os/Build", "ID", SpoofState::profile.ID);
+    jni.setField("android/os/Build", "TYPE", SpoofState::profile.TYPE);
+    jni.setField("android/os/Build", "TAGS", SpoofState::profile.TAGS);
+    jni.setField("android/os/Build$VERSION", "RELEASE", SpoofState::profile.RELEASE);
+    jni.setField("android/os/Build$VERSION", "INCREMENTAL", SpoofState::profile.INCREMENTAL);
+
+    // GPS DEX Injection (if enabled)
+    if (SpoofState::profile.gpsEnabled) {
+        LOGD("GPS spoofing enabled, injecting DEX...");
+        bool gpsOk = injectGpsDex(env, appDir, 
+                                   SpoofState::profile.gpsLatitude,
+                                   SpoofState::profile.gpsLongitude,
+                                   SpoofState::profile.gpsAccuracy);
+        if (!gpsOk) {
+            LOGE("GPS DEX injection failed, continuing without GPS spoofing");
         }
     }
 
+    LOGD("SpoofX-Inject Initialized Successfully for profile: %s", SpoofState::profile.profileName);
     return true;
 }
